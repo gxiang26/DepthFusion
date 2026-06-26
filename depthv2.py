@@ -1,14 +1,5 @@
 # -*- coding: utf-8 -*-
-"""
-Single-script loader:
-- build DepthAnythingV2 DINOv2 encoder (DinoVisionTransformer + DINOv2())
-- load encoder weights from a DepthAnythingV2 checkpoint
-- extract 12-layer patch tokens (and optional cls tokens)
 
-Place this file inside your Depth-Anything-V2 codebase so that:
-  from dinov2_layers import Mlp, PatchEmbed, SwiGLUFFNFused, MemEffAttention, NestedTensorBlock
-works.
-"""
 
 from functools import partial
 import math
@@ -20,8 +11,7 @@ import torch
 import torch.nn as nn
 from torch.nn.init import trunc_normal_
 
-# ====== IMPORTANT: these come from Depth-Anything-V2 repo ======
-# make sure this script is in the same package path, or adjust the import
+
 from depth_anything_v2.dinov2_layers import Mlp, PatchEmbed, SwiGLUFFNFused, MemEffAttention, NestedTensorBlock as Block
 
 
@@ -29,7 +19,7 @@ logger = logging.getLogger("dinov2")
 
 
 # -----------------------------
-# 1) DINOv2 Encoder (your pasted code)
+
 # -----------------------------
 def named_apply(fn: Callable, module: nn.Module, name="", depth_first=True, include_root=False) -> nn.Module:
     if not depth_first and include_root:
@@ -323,7 +313,7 @@ def DINOv2(model_name: str):
 
 
 # -----------------------------
-# 2) Load DepthAnythingV2 encoder(pretrained) weights into this DINOv2
+
 # -----------------------------
 def _strip_module_prefix(sd: dict) -> dict:
     return {k.replace("module.", ""): v for k, v in sd.items()}
@@ -378,16 +368,13 @@ def load_depthanything_encoder_weights(dino: nn.Module, ckpt_path: str, device: 
     missing, unexpected = dino.load_state_dict(enc_sd, strict=False)
     print(f"[LOAD] encoder keys={len(enc_sd)} from {ckpt_path}")
     print(f"       missing={len(missing)} unexpected={len(unexpected)}")
-    # 如需细看：
-    # print("missing:", missing)
-    # print("unexpected:", unexpected)
 
     dino.to(device).eval()
     return dino
 
 
 # -----------------------------
-# 3) Extract 12 layer features
+
 # -----------------------------
 @torch.inference_mode()
 def extract_12_layers(dino: DinoVisionTransformer, x: torch.Tensor, with_cls: bool = False):
@@ -409,30 +396,3 @@ def extract_12_layers(dino: DinoVisionTransformer, x: torch.Tensor, with_cls: bo
         return feats
 
 
-# def main():
-#     # ======= YOU CHANGE THESE =======
-#     CKPT_PATH = r"E:\code\Depth-Anything-V2-main\checkpoints\depth_anything_v2_vitb.pth"
-#     ENCODER_NAME = "vitb"  # vits/vitb/vitl/vitg
-#     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-#
-#     assert Path(CKPT_PATH).exists(), f"ckpt not found: {CKPT_PATH}"
-#
-#     # build encoder
-#     dino = DINOv2(ENCODER_NAME)
-#
-#     # load weights
-#     dino = load_depthanything_encoder_weights(dino, CKPT_PATH, device=DEVICE)
-#
-#     # input (H,W should be multiple of 14)
-#     x = torch.randn(1, 3, 640, 480, device=DEVICE)
-#
-#     # extract 12 layer patch tokens
-#     layers = extract_12_layers(dino, x, with_cls=False)
-#     print("num layers:", len(layers))
-#     for i, t in enumerate(layers):
-#         print(f"layer[{i:02d}] {tuple(t.shape)}  mean={t.mean().item():.4f}  std={t.std().item():.4f}")
-#
-#
-#
-# if __name__ == "__main__":
-#     main()
