@@ -1,4 +1,4 @@
-# fusion_pidnet_full.py
+
 from __future__ import annotations
 
 from typing import List, Tuple, Optional, Sequence, Dict, Union
@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# DepthAnythingV2 encoder extraction file (your "depthv2.py")
+
 from depthv2 import (
     DINOv2,
     load_depthanything_encoder_weights,
@@ -16,7 +16,6 @@ from depthv2 import (
 )
 
 # ============================================================
-# Utils
 # ============================================================
 
 def maybe_to_float01(x: torch.Tensor) -> torch.Tensor:
@@ -27,7 +26,7 @@ def maybe_to_float01(x: torch.Tensor) -> torch.Tensor:
     return x.float() / 255.0
 
 def to_3ch(x: torch.Tensor) -> torch.Tensor:
-    """(B,1,H,W)->(B,3,H,W) or keep (B,3,H,W)."""
+
     if x.dim() != 4:
         raise ValueError(f"Expect BCHW, got {tuple(x.shape)}")
     if x.size(1) == 1:
@@ -37,7 +36,7 @@ def to_3ch(x: torch.Tensor) -> torch.Tensor:
     raise ValueError(f"Expect 1 or 3 channels, got C={x.size(1)}")
 
 def resize_bchw(x: torch.Tensor, hw: Tuple[int, int]) -> torch.Tensor:
-    """BCHW bilinear resize; if already target size, no-op."""
+
     if x.shape[-2:] == hw:
         return x
     return F.interpolate(x, size=hw, mode="bilinear", align_corners=False)
@@ -58,10 +57,7 @@ def ceil_hw_to_multiple(hw: Tuple[int, int], multiple: int) -> Tuple[int, int]:
     return (H2, W2)
 
 def pad_bchw_to_hw(x: torch.Tensor, target_hw: Tuple[int, int], mode: str = "replicate") -> torch.Tensor:
-    """
-    Pad only right/bottom so output becomes target_hw.
-    x: (B,C,H,W)
-    """
+
     Ht, Wt = target_hw
     H, W = x.shape[-2:]
     pad_h = Ht - H
@@ -73,7 +69,7 @@ def pad_bchw_to_hw(x: torch.Tensor, target_hw: Tuple[int, int], mode: str = "rep
     return F.pad(x, (0, pad_w, 0, pad_h), mode=mode)
 
 def crop_bchw_to_hw(x: torch.Tensor, hw: Tuple[int, int]) -> torch.Tensor:
-    """Crop back to original (undo right/bottom padding)."""
+
     H, W = hw
     return x[..., :H, :W]
 
@@ -84,21 +80,13 @@ def _largest_divisor_leq(n: int, max_div: int) -> int:
     return 1
 
 # ============================================================
-# 1) Frozen Feature Extractors
 # ============================================================
 
 import timm
 from timm.data import resolve_model_data_config
 
 class FrozenDinoV3ConvNeXtFeatures(nn.Module):
-    """
-    Frozen timm DINOv3 ConvNeXt features (4 stages).
 
-    Return:
-      feats_list: list len=4, each (B, C_i, H_i, W_i)
-      strides: list len=4, e.g. [4,8,16,32]
-      channels: list len=4, e.g. [128,256,512,1024] for convnext_base
-    """
     def __init__(
         self,
         model_name: str = "convnext_base.dinov3_lvd1689m",
@@ -139,7 +127,7 @@ class FrozenDinoV3ConvNeXtFeatures(nn.Module):
             self.mean = (0.485, 0.456, 0.406)
             self.std  = (0.229, 0.224, 0.225)
 
-        # feature_info provides channels and stride reductions
+
         fi = getattr(self.model, "feature_info", None)
         if fi is None:
             raise RuntimeError("features_only model must have feature_info.")
@@ -158,17 +146,11 @@ class FrozenDinoV3ConvNeXtFeatures(nn.Module):
         x = resize_bchw(x, hw)
         x = normalize_chw(x, self.mean, self.std)
 
-        feats = self.model(x)  # list of BCHW
+        feats = self.model(x)
         return list(feats), list(self.strides), list(self.channels)
 
 class FrozenDepthAnythingEncoderTokens(nn.Module):
-    """
-    Frozen DepthAnythingV2 encoder (DINOv2) intermediate patch tokens.
 
-    Return:
-      feats: list len=12, each (B, N_patch, C)
-      patch_grid: (H_patch, W_patch)
-    """
     def __init__(
         self,
         ckpt_path: str,
@@ -210,22 +192,16 @@ class FrozenDepthAnythingEncoderTokens(nn.Module):
         x = resize_bchw(x, self.img_hw)
         x = normalize_chw(x, self.mean, self.std)
 
-        feats = extract_12_layers(self.encoder, x, with_cls=False)  # tuple len=12
+        feats = extract_12_layers(self.encoder, x, with_cls=False)
         feats = list(feats)
         gh, gw = self.img_hw[0] // self.patch, self.img_hw[1] // self.patch
         return feats, (gh, gw)
 
 # ============================================================
-# 2) Depth-guided "Hypergraph" via Node->Depth Cross-Attention (no M=16)
-# ============================================================
-
-# ============================================================
-# 2) Hypergraph blocks (original style):
-#    depth tokens -> M hyperedges -> cosine similarity assign -> node->edge->node
 # ============================================================
 
 class DepthToHyperedges(nn.Module):
-    """Depth tokens -> M hyperedge embeddings via cross-attention (learnable queries)."""
+
     def __init__(self, c_d: int, M: int = 16, d_model: int = 256, heads: int = 8, dropout: float = 0.0):
         super().__init__()
         assert d_model % heads == 0
@@ -236,21 +212,16 @@ class DepthToHyperedges(nn.Module):
         self.attn = nn.MultiheadAttention(d_model, heads, dropout=dropout, batch_first=True)
 
     def forward(self, X_d: torch.Tensor) -> torch.Tensor:
-        """
-        X_d: (B, Nd, Cd)
-        return E: (B, M, d_model)
-        """
+
         B, _, _ = X_d.shape
-        KV = self.ln_kv(self.kv_proj(X_d))        # (B,Nd,D)
-        Q  = self.q.expand(B, -1, -1)             # (B,M,D)
+        KV = self.ln_kv(self.kv_proj(X_d))
+        Q  = self.q.expand(B, -1, -1)
         E, _ = self.attn(Q, KV, KV, need_weights=False)
-        return E                                  # (B,M,D)
+        return E
 
 
 class NodeToHyperedgeAssign(nn.Module):
-    """
-    A(B,N,M) = softmax( cosine(node,edge) / tau )
-    """
+
     def __init__(self, Cn: int, Ce: int, d: int = 256, tau_init: float = 0.07, learnable_tau: bool = True):
         super().__init__()
         self.q_proj = nn.Linear(Cn, d)
@@ -261,24 +232,17 @@ class NodeToHyperedgeAssign(nn.Module):
             self.register_buffer("log_tau", torch.log(torch.tensor(float(tau_init))))
 
     def forward(self, X_n: torch.Tensor, E: torch.Tensor):
-        """
-        X_n: (B,N,Cn)
-        E:   (B,M,Ce)
-        """
-        Q = F.normalize(self.q_proj(X_n), dim=-1)      # (B,N,d)
-        K = F.normalize(self.k_proj(E), dim=-1)        # (B,M,d)
-        logits = Q @ K.transpose(-1, -2)               # (B,N,M)
+
+        Q = F.normalize(self.q_proj(X_n), dim=-1)
+        K = F.normalize(self.k_proj(E), dim=-1)
+        logits = Q @ K.transpose(-1, -2)
         tau = torch.exp(self.log_tau).clamp(min=1e-4)
         A = torch.softmax(logits / tau, dim=-1)
         return A, logits
 
 
 class HypergraphFuseLayer(nn.Module):
-    """
-    node->edge (degree-normalized) -> fuse with depth edges -> edge->node
-    + residual scales (avoid oversmoothing)
-    + optional top-k sparsify for locality
-    """
+
     def __init__(self, Cn: int, Ce: int, d: int = 256, sparse_topk: int = 0, dropout: float = 0.0):
         super().__init__()
         self.assign = NodeToHyperedgeAssign(Cn, Ce, d=d, tau_init=0.07, learnable_tau=True)
@@ -314,42 +278,31 @@ class HypergraphFuseLayer(nn.Module):
         return A
 
     def forward(self, X_n: torch.Tensor, E: torch.Tensor):
-        """
-        X_n: (B,N,Cn)
-        E:   (B,M,Ce)
-        return:
-          X_out: (B,N,Cn)
-          E_out: (B,M,d)   (edge feature updated in hidden dim d)
-          A:     (B,N,M)
-        """
-        A, _ = self.assign(X_n, E)            # (B,N,M)
+
+        A, _ = self.assign(X_n, E)
         A = self._sparsify(A)
 
-        Xd = self.node_proj(X_n)              # (B,N,d)
-        At = A.transpose(1, 2)                # (B,M,N)
+        Xd = self.node_proj(X_n)
+        At = A.transpose(1, 2)
 
         # node->edge degree-normalized mean
         denom = At.sum(dim=-1, keepdim=True) + 1e-6
-        H_from_nodes = (At @ Xd) / denom      # (B,M,d)
+        H_from_nodes = (At @ Xd) / denom
 
-        Ed = self.edge_proj(E)                # (B,M,d)
+        Ed = self.edge_proj(E)
         delta_e = self.edge_fuse(torch.cat([Ed, H_from_nodes], dim=-1))
         E_out = Ed + self.edge_scale * delta_e
 
         # edge->node
-        X_up = A @ E_out                      # (B,N,d)
-        X_up = self.back_proj(X_up)           # (B,N,Cn)
+        X_up = A @ E_out
+        X_up = self.back_proj(X_up)
 
         X_out = self.norm(X_n + self.node_scale * X_up)
         return X_out, E_out, A
 
 
 class DepthGuidedHypergraphBlock(nn.Module):
-    """
-    原始超图方式封装：
-      depth tokens -> M hyperedges
-      node tokens  -> assign(A) -> hypergraph fuse (可堆叠多层)
-    """
+
     def __init__(
         self,
         node_dim: int,
@@ -370,28 +323,22 @@ class DepthGuidedHypergraphBlock(nn.Module):
         Ce = hyper_d_model
         for _ in range(int(hg_layers)):
             layers.append(HypergraphFuseLayer(node_dim, Ce, d=hg_hidden, sparse_topk=hg_sparse_topk, dropout=dropout))
-            Ce = hg_hidden  # edge dim becomes d after first layer
+            Ce = hg_hidden
         self.hg_layers = nn.ModuleList(layers)
 
     def forward(self, x_n: torch.Tensor, x_d: torch.Tensor) -> torch.Tensor:
-        """
-        x_n: (B,N,Cn)
-        x_d: (B,Nd,Cd)
-        """
-        E = self.depth2edge(x_d)              # (B,M,De)
+
+        E = self.depth2edge(x_d)
         for hg in self.hg_layers:
             x_n, E, _ = hg(x_n, E)
         return x_n
 
 
 # ============================================================
-# 3) Cross-modal fusion (DepthForge-style) - token版保持不变，但每个尺度各一套
 # ============================================================
 
 class CrossModalForgeFusion(nn.Module):
-    """
-    gate base + token dictionary attention + small-scale residual injection
-    """
+
     def __init__(
         self,
         embed_dims: int,
@@ -453,7 +400,7 @@ class CrossModalForgeFusion(nn.Module):
             gate = torch.sigmoid(self.gate_mlp(h)).view(B, 1, 1)
         else:
             h = torch.cat([x_vin, x_irn], dim=-1)
-            gate = torch.sigmoid(self.gate_mlp(h))  # (B,N,1)
+            gate = torch.sigmoid(self.gate_mlp(h))
 
         x_f0 = gate * x_vin + (1.0 - gate) * x_irn
         x_f0 = self.norm_f0(x_f0)
@@ -478,7 +425,6 @@ class CrossModalForgeFusion(nn.Module):
         return x_f0 + self.scale * delta
 
 # ============================================================
-# 4) Multi-Scale Decoder (改为 2D 特征版，但逻辑沿用你原来的 Token-DRD 解码器)
 # ============================================================
 
 class AttentionGate2D(nn.Module):
@@ -540,23 +486,14 @@ class UpFuseBlock(nn.Module):
         return x
 
 class MultiScaleFeatureDRDDecoder(nn.Module):
-    """
-    输入：4层 fused feature maps (B,Ci,Hi,Wi)  [对应 stride4/8/16/32]
-    输出：fused gray logits at out_hw
-    逻辑沿用你原 Token-DRD:
-      - 每尺度对齐到 embed_dim
-      - 选择 fuse_hw
-      - resize+gate+concat -> gamma融合
-      - 逐级 upsample + gated skip
-      - 再额外从 stride4 up 到 out_hw（避免一步插值造成网格/糊）
-    """
+
     def __init__(
         self,
         in_channels: Sequence[int],
         embed_dim: int = 256,
-        fuse_to: str = "middle",      # "lowest"/"middle"/"highest"
+        fuse_to: str = "middle",
         out_channels: int = 1,
-        use_transformer: bool = False,  # 默认关掉，避免位置编码周期纹理
+        use_transformer: bool = False,
     ):
         super().__init__()
         self.in_channels = list(in_channels)
@@ -567,7 +504,7 @@ class MultiScaleFeatureDRDDecoder(nn.Module):
         self.embed_dim = embed_dim
         self.use_transformer = use_transformer
 
-        # align each scale to embed_dim
+
         self.align = nn.ModuleList([
             nn.Sequential(
                 nn.Conv2d(c, embed_dim, kernel_size=1, bias=False),
@@ -584,10 +521,10 @@ class MultiScaleFeatureDRDDecoder(nn.Module):
             ConvGNAct(embed_dim, embed_dim, 3, 1, 1),
         )
 
-        # upsample blocks between scales (最多 3 次)
+
         self.up_blocks = nn.ModuleList([UpFuseBlock(embed_dim) for _ in range(self.num_scales - 1)])
 
-        # 从最大尺度(stride4) -> out_hw 的额外两级上采样（stride2, stride1）
+
         self.post_up1 = UpFuseBlock(embed_dim)
         self.post_up2 = UpFuseBlock(embed_dim)
 
@@ -599,42 +536,42 @@ class MultiScaleFeatureDRDDecoder(nn.Module):
 
     def pick_fuse_hw(self, hw_list: List[Tuple[int, int]]) -> Tuple[int, int]:
         areas = [h * w for h, w in hw_list]
-        order = sorted(range(len(hw_list)), key=lambda i: areas[i])  # low->high
+        order = sorted(range(len(hw_list)), key=lambda i: areas[i])
         if self.fuse_to == "lowest":
             return hw_list[order[0]]
         if self.fuse_to == "highest":
             return hw_list[order[-1]]
-        return hw_list[order[len(order) // 2]]  # middle
+        return hw_list[order[len(order) // 2]]
 
     def forward(self, feats_list: List[torch.Tensor], out_hw: Tuple[int, int]) -> torch.Tensor:
         assert len(feats_list) == self.num_scales
 
-        # align
+
         maps = []
         hw_list = []
         for i, f in enumerate(feats_list):
-            fa = self.align[i](f)  # (B,D,Hi,Wi)
+            fa = self.align[i](f)
             maps.append(fa)
             hw_list.append(fa.shape[-2:])
 
-        # build skip dict
+
         skip_dict: Dict[Tuple[int, int], torch.Tensor] = {}
         for f, hw in zip(maps, hw_list):
             skip_dict[hw] = f if hw not in skip_dict else 0.5 * (skip_dict[hw] + f)
 
         fuse_hw = self.pick_fuse_hw(hw_list)
 
-        # resize to fuse_hw + gate
+
         resized = []
         for i, f in enumerate(maps):
             fr = f if f.shape[-2:] == fuse_hw else F.interpolate(f, size=fuse_hw, mode="bilinear", align_corners=False)
             fr = self.scale_gates[i](fr)
             resized.append(fr)
 
-        x = self.gamma(torch.cat(resized, dim=1))  # (B,D,Hf,Wf)
+        x = self.gamma(torch.cat(resized, dim=1))
 
-        # upsample to larger scales (from fuse_hw -> ... -> max hw among inputs)
-        unique_hw = sorted(set(hw_list + [fuse_hw]), key=lambda hw: hw[0] * hw[1])  # low->high
+
+        unique_hw = sorted(set(hw_list + [fuse_hw]), key=lambda hw: hw[0] * hw[1])
         start = unique_hw.index(fuse_hw)
 
         step = 0
@@ -644,8 +581,7 @@ class MultiScaleFeatureDRDDecoder(nn.Module):
             x = self.up_blocks[step](x, skip_dict.get(nxt, None), nxt)
             step += 1
 
-        # 现在 x 通常在最大尺度（stride4 对齐后的大小）
-        # 再两级上采样到 out_hw，避免一步插值
+
         if x.shape[-2:] != out_hw:
             mid_hw = (out_hw[0] // 2, out_hw[1] // 2)
             if x.shape[-2:] != mid_hw:
@@ -654,44 +590,37 @@ class MultiScaleFeatureDRDDecoder(nn.Module):
                 x = self.post_up2(x, None, out_hw)
 
         feat = self.final_refine(x)
-        logits = self.out_head(feat)  # (B,1,H,W)
+        logits = self.out_head(feat)
         return logits
 
 # ============================================================
-# 5) Fusion Backbone + Full FusionNet (with internal padding)
 # ============================================================
 
 class IRVIS_HypergraphFusionBackbone(nn.Module):
-    """
-    IR/VI -> frozen DINOv3 ConvNeXt feature maps (nodes)
-          -> frozen DepthAnything tokens (hyperedges)
-          -> per-scale depth-guided hypergraph (node cross-attend depth tokens)
-          -> per-scale cross-modal fusion
-    return: fused_feats_list (len=4), where each is (B,Ci,Hi,Wi)
-    """
+
     def __init__(
         self,
         depth_ckpt_path: str,
         train_hw: Tuple[int, int] = (448, 448),
 
-        # DINOv3 CNN
+
         dino_model_name: str = "convnext_base.dinov3_lvd1689m",
         dino_out_indices: Sequence[int] = (0, 1, 2, 3),
 
-        # DepthAnything 12层 -> 4层选择（浅->深）
+
         depth_layer_ids_4: Sequence[int] = (2, 5, 8, 11),
 
-        # depth-guided hypergraph (cross-attn)
+
         hg_d_model: int = 256,
         hg_heads: int = 8,
         hg_layers: int = 1,
         hg_dropout: float = 0.0,
 
-        # 可选：对 depth tokens 轻度压缩（控制显存/速度），默认 0=不压缩
-        # 例如你可设 (256,256,0,0)
+
+
         depth_pool_Ms: Sequence[int] = (0, 0, 0, 0),
 
-        # cross-modal fusion
+
         fusion_dict_tokens: int = 64,
 
         pad_mode: str = "replicate",
@@ -708,7 +637,7 @@ class IRVIS_HypergraphFusionBackbone(nn.Module):
         self.depth_pool_Ms = list(depth_pool_Ms)
         assert len(self.depth_pool_Ms) == 4
 
-        # Frozen feature extractors
+
         self.dino = FrozenDinoV3ConvNeXtFeatures(
             model_name=dino_model_name,
             out_indices=dino_out_indices,
@@ -716,29 +645,27 @@ class IRVIS_HypergraphFusionBackbone(nn.Module):
         )
         self.depth = FrozenDepthAnythingEncoderTokens(
             ckpt_path=depth_ckpt_path,
-            img_hw=train_hw,  # will be overwritten to work_hw below
+            img_hw=train_hw,
             device=device,
         )
 
-        # pad multiple: lcm(depth_patch=14, convnext_stem_stride=4) = 28  (小得多，不会像224那样夸张)
+
         self.pad_multiple = _lcm(int(self.depth.patch), 4)
         self.work_hw = ceil_hw_to_multiple(self.train_hw, self.pad_multiple)
 
-        # Make DepthAnything extractor resize to work_hw
+
         self.depth.img_hw = self.work_hw
 
         depth_dim = int(self.depth.embed_dim)
-        node_dims = list(self.dino.channels)  # 4 scales, e.g. [128,256,512,1024]
+        node_dims = list(self.dino.channels)
 
-        # depth token pools (optional)
-        # 这里把 depth_pool_Ms 复用成 “每个尺度的超边数 M”
-        # 为了兼容你现有脚本默认 [0,0,0,0]，当 M<=0 时默认用 16（不会把超图关掉）
+
         self.hyper_Ms = [int(M) if (M is not None and int(M) > 0) else 16 for M in self.depth_pool_Ms]
 
-        # 保持 forward 结构不变：depth_pools 仍然存在，但这里统一 Identity（不再做 token pool）
+
         self.depth_pools = nn.ModuleList([nn.Identity() for _ in range(4)])
 
-        # per-scale hypergraph blocks（原始超图：depth->M edges->assign->node update）
+
         self.hg_blocks = nn.ModuleList([
             DepthGuidedHypergraphBlock(
                 node_dim=node_dims[i],
@@ -746,15 +673,15 @@ class IRVIS_HypergraphFusionBackbone(nn.Module):
                 hyper_M=self.hyper_Ms[i],
                 hyper_d_model=hg_d_model,
                 hyper_heads=hg_heads,
-                hg_hidden=hg_d_model,  # 为了不引入新参数，这里 hidden = hg_d_model
+                hg_hidden=hg_d_model,
                 hg_layers=hg_layers,
-                hg_sparse_topk=4,  # 固定 4（等同原始代码默认）
+                hg_sparse_topk=4,
                 dropout=hg_dropout,
             )
             for i in range(4)
         ])
 
-        # per-scale fusion
+
         self.fusion = nn.ModuleList([
             CrossModalForgeFusion(node_dims[i], token_length=fusion_dict_tokens, gate_type="token")
             for i in range(4)
@@ -764,19 +691,19 @@ class IRVIS_HypergraphFusionBackbone(nn.Module):
 
     def train(self, mode: bool = True):
         super().train(mode)
-        # keep frozen backbones eval
+
         self.dino.eval()
         self.depth.eval()
         return self
 
     @staticmethod
     def feat_to_tokens(feat: torch.Tensor) -> torch.Tensor:
-        # (B,C,H,W) -> (B,HW,C)
+
         return feat.flatten(2).transpose(1, 2).contiguous()
 
     @staticmethod
     def tokens_to_feat(tokens: torch.Tensor, hw: Tuple[int, int]) -> torch.Tensor:
-        # (B,HW,C) -> (B,C,H,W)
+
         B, N, C = tokens.shape
         H, W = hw
         if N != H * W:
@@ -784,14 +711,7 @@ class IRVIS_HypergraphFusionBackbone(nn.Module):
         return tokens.transpose(1, 2).reshape(B, C, H, W).contiguous()
 
     def forward(self, ir: torch.Tensor, vi: torch.Tensor):
-        """
-        ir, vi: (B,1,H,W) or (B,3,H,W)
-        Internally:
-          - resize to train_hw
-          - pad to work_hw (multiple of 28)
-          - extract ConvNeXt features at work_hw
-          - extract DepthAnything tokens at work_hw
-        """
+
         ir = maybe_to_float01(ir)
         vi = maybe_to_float01(vi)
 
@@ -801,53 +721,49 @@ class IRVIS_HypergraphFusionBackbone(nn.Module):
         ir_w = pad_bchw_to_hw(ir, self.work_hw, mode=self.pad_mode)
         vi_w = pad_bchw_to_hw(vi, self.work_hw, mode=self.pad_mode)
 
-        # frozen extractors
+
         with torch.no_grad():
-            dino_ir_feats, _, _ = self.dino(ir_w, hw=self.work_hw)  # 4 scales
+            dino_ir_feats, _, _ = self.dino(ir_w, hw=self.work_hw)
             dino_vi_feats, _, _ = self.dino(vi_w, hw=self.work_hw)
 
-            dep_ir_all, _ = self.depth(ir_w)  # 12 layers tokens
+            dep_ir_all, _ = self.depth(ir_w)
             dep_vi_all, _ = self.depth(vi_w)
 
         fused_feats_list: List[torch.Tensor] = []
 
         for i in range(4):
-            f_ir = dino_ir_feats[i]  # (B,Ci,Hi,Wi)
+            f_ir = dino_ir_feats[i]
             f_vi = dino_vi_feats[i]
             Hi, Wi = f_ir.shape[-2:]
 
-            # node tokens
-            Xn_ir = self.feat_to_tokens(f_ir)  # (B,Ni,Ci)
+
+            Xn_ir = self.feat_to_tokens(f_ir)
             Xn_vi = self.feat_to_tokens(f_vi)
 
-            # choose 4 depth layers: shallow->deep mapping
+
             lid = self.depth_layer_ids_4[i]
-            Xd_ir = dep_ir_all[lid]  # (B,Nd,Cd)
+            Xd_ir = dep_ir_all[lid]
             Xd_vi = dep_vi_all[lid]
 
-            # optional pool (Identity if M<=0)
+
             Xd_ir_m = self.depth_pools[i](Xd_ir)
             Xd_vi_m = self.depth_pools[i](Xd_vi)
 
-            # depth-guided hypergraph update (node cross-attend depth tokens)
+
             Xn_ir = self.hg_blocks[i](Xn_ir, Xd_ir_m)
             Xn_vi = self.hg_blocks[i](Xn_vi, Xd_vi_m)
 
-            # cross-modal fusion
-            Xf = self.fusion[i](Xn_ir, Xn_vi)  # (B,Ni,Ci)
 
-            # back to feature map
-            fused_map = self.tokens_to_feat(Xf, (Hi, Wi))  # (B,Ci,Hi,Wi)
+            Xf = self.fusion[i](Xn_ir, Xn_vi)
+
+
+            fused_map = self.tokens_to_feat(Xf, (Hi, Wi))
             fused_feats_list.append(fused_map)
 
-        return fused_feats_list  # 4 scales at work_hw
+        return fused_feats_list
 
 class IRVISFusionNet(nn.Module):
-    """
-    Full fusion model:
-      backbone -> 4-scale fused feature maps -> MultiScaleFeatureDRDDecoder -> fused gray
-    Output cropped back to train_hw.
-    """
+
     def __init__(
         self,
         depth_ckpt_path: str,
@@ -856,14 +772,13 @@ class IRVISFusionNet(nn.Module):
         dino_model_name: str = "convnext_base.dinov3_lvd1689m",
         depth_layer_ids_4: Sequence[int] = (2, 5, 8, 11),
 
-        # depth-guided hypergraph
+
         hg_d_model: int = 256,
         hg_heads: int = 8,
         hg_layers: int = 1,
         hg_dropout: float = 0.0,
-        depth_pool_Ms: Sequence[int] = (0, 0, 0, 0),  # 可改(256,256,0,0)
+        depth_pool_Ms: Sequence[int] = (0, 0, 0, 0),
 
-        # fusion + decoder
         fusion_dict_tokens: int = 64,
         decoder_embed_dim: int = 256,
         decoder_fuse_to: str = "middle",
@@ -887,10 +802,10 @@ class IRVISFusionNet(nn.Module):
             device=device,
         )
 
-        # decoder input channels = ConvNeXt stage channels
+
         in_ch = self.backbone.node_dims
         self.decoder = MultiScaleFeatureDRDDecoder(
-            in_channels=in_ch,            # [C4,C8,C16,C32] order is out_indices order
+            in_channels=in_ch,
             embed_dim=decoder_embed_dim,
             fuse_to=decoder_fuse_to,
             out_channels=1,
@@ -899,32 +814,28 @@ class IRVISFusionNet(nn.Module):
 
     def train(self, mode: bool = True):
         super().train(mode)
-        # backbone 内部会保持 frozen extractor eval
+
         return self
 
     def forward(self, ir: torch.Tensor, vi: torch.Tensor) -> torch.Tensor:
-        fused_feats = self.backbone(ir, vi)  # 4-scale maps at work_hw
+        fused_feats = self.backbone(ir, vi)
         logits_w = self.decoder(fused_feats, out_hw=self.backbone.work_hw)
-        fused_w = torch.sigmoid(logits_w)  # (B,1,Hwork,Wwork)
-        fused = crop_bchw_to_hw(fused_w, self.train_hw)  # (B,1,Htrain,Wtrain)
+        fused_w = torch.sigmoid(logits_w)
+        fused = crop_bchw_to_hw(fused_w, self.train_hw)
         return fused
 
 # ============================================================
-# 6) Wrap with PIDNet for joint training
 # ============================================================
 
 class FusionPIDNetSystem(nn.Module):
-    """
-    Joint system: fused image -> PIDNet -> segmentation logits/list.
-    PIDNet is TRAINABLE here.
-    """
+
     def __init__(self, fusion_net: IRVISFusionNet, pidnet: nn.Module):
         super().__init__()
         self.fusion = fusion_net
         self.pidnet = pidnet
 
     def forward(self, ir: torch.Tensor, vi: torch.Tensor):
-        fused = self.fusion(ir, vi)       # (B,1,Htrain,Wtrain)
-        fused3 = fused.repeat(1, 3, 1, 1) # PIDNet expects 3ch
+        fused = self.fusion(ir, vi)
+        fused3 = fused.repeat(1, 3, 1, 1)
         seg_out = self.pidnet(fused3)
         return fused, seg_out
